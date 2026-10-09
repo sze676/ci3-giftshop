@@ -121,7 +121,10 @@ class StaffController extends CI_Controller {
 	 * Renders the edit form for a product and applies the update POST.
 	 *
 	 * A missing id is a hard 404 via `show_error`. On submit the same
-	 * rule set runs, the SKU check excludes this product's own id, and a
+	 * rule set runs with price/markup validation. Markup is a one-time
+	 * adjustment to the base price; only the final selling price is stored.
+	 * Errors re-render the form so entered prices and percentages are kept.
+	 * The SKU check excludes this product's own id, and a
 	 * new image is optional: `image_url` is only overwritten when an
 	 * upload actually succeeded, otherwise the existing path is kept.
 	 *
@@ -130,56 +133,80 @@ class StaffController extends CI_Controller {
 	 */
 	public function edit_product($id)
 	{
+		$this->load->helper('pricing');
 		$product = $this->Product_model->get_by_id((int) $id, FALSE);
 
 		if ( ! $product) {
 			show_error('Product not found.');
 		}
 
+		$error = NULL;
 		if ($this->input->post('update')) {
-			$this->form_validation->set_rules($this->config->item('giftshop_product'));
-
-			if ($this->form_validation->run() === FALSE) {
-				$this->session->set_flashdata('message', validation_errors() ?: 'Please correct the highlighted fields.');
-				redirect('staff/inventory');
+			$rules = $this->config->item('giftshop_product');
+			foreach ($rules as &$rule) {
+				if ($rule['field'] === 'price') {
+					$rule['label'] = 'Base Price';
+					$rule['rules'] = 'required|trim|regex_match[/^[0-9]{1,8}(?:[.][0-9]{1,2})?$/D]';
+					$rule['errors'] = array('regex_match' => 'Base Price must be nonnegative with up to two decimal places and at most ₱99,999,999.99.');
+				}
 			}
-
-			$sku = $this->input->post('sku', TRUE);
-			if ($sku && $this->Product_model->sku_exists($sku, (int) $id)) {
-				$this->session->set_flashdata('message', "Error: SKU '$sku' already exists!");
-				redirect('staff/inventory');
-			}
-
-			$fields = array(
-				'name' => $this->input->post('name', TRUE),
-				'category_id' => (int) $this->input->post('category_id'),
-				'description' => $this->input->post('description', TRUE),
-				'price' => $this->input->post('price'),
-				'stock_quantity' => (int) $this->input->post('stock_quantity'),
-				'sku' => $sku,
-				'size' => $this->input->post('size', TRUE),
-				'color' => $this->input->post('color', TRUE),
-				'status' => $this->input->post('status', TRUE),
-				'low_stock_threshold' => $this->input->post('low_stock_threshold', TRUE) !== '' ? (int) $this->input->post('low_stock_threshold', TRUE) : 10
+			unset($rule);
+			$rules[] = array(
+				'field' => 'markup_percent',
+				'label' => 'Markup',
+				'rules' => 'trim|regex_match[/^[0-9]{1,8}(?:[.][0-9]{1,2})?$/D]',
+				'errors' => array('regex_match' => 'Markup must be a nonnegative percentage with up to two decimal places.')
 			);
+			$this->form_validation->set_rules($rules);
 
-			$upload = $this->_upload_product_image('product_' . time() . '_');
-			if ($upload['error'] !== NULL) {
-				$this->session->set_flashdata('message', $upload['error']);
-				redirect('staff/inventory');
-			}
-			if ($upload['image_url'] !== '') {
-				$fields['image_url'] = $upload['image_url'];
-			}
+			$posted_price = $this->input->post('price');
+			$posted_markup = $this->input->post('markup_percent');
+			if (($posted_price !== NULL && ! is_string($posted_price)) || ($posted_markup !== NULL && ! is_string($posted_markup))) {
+				$error = 'Base Price and Markup must each be a single numeric value.';
+			} elseif ($this->form_validation->run() === FALSE) {
+				$error = implode(' ', $this->form_validation->error_array());
+			} else {
+				$markup = $this->form_validation->set_value('markup_percent');
+				$total_price = giftshop_price_with_markup($this->form_validation->set_value('price'), $markup === '' ? '0' : $markup);
+				$sku = $this->input->post('sku', TRUE);
 
-			$this->Product_model->update((int) $id, $fields);
-			$this->session->set_flashdata('message', 'Product Updated Successfully');
-			redirect('staff/inventory');
+				if ($total_price === NULL) {
+					$error = 'The selling price after markup cannot exceed ₱99,999,999.99.';
+				} elseif ($sku && $this->Product_model->sku_exists($sku, (int) $id)) {
+					$error = "Error: SKU '$sku' already exists!";
+				} else {
+					$upload = $this->_upload_product_image('product_' . time() . '_');
+					if ($upload['error'] !== NULL) {
+						$error = $upload['error'];
+					} else {
+						$fields = array(
+							'name' => $this->input->post('name', TRUE),
+							'category_id' => (int) $this->input->post('category_id'),
+							'description' => $this->input->post('description', TRUE),
+							'price' => $total_price,
+							'stock_quantity' => (int) $this->input->post('stock_quantity'),
+							'sku' => $sku,
+							'size' => $this->input->post('size', TRUE),
+							'color' => $this->input->post('color', TRUE),
+							'status' => $this->input->post('status', TRUE),
+							'low_stock_threshold' => $this->input->post('low_stock_threshold', TRUE) !== '' ? (int) $this->input->post('low_stock_threshold', TRUE) : 10
+						);
+						if ($upload['image_url'] !== '') {
+							$fields['image_url'] = $upload['image_url'];
+						}
+
+						$this->Product_model->update((int) $id, $fields);
+						$this->session->set_flashdata('message', 'Product Updated Successfully');
+						redirect('staff/inventory');
+					}
+				}
+			}
 		}
 
 		$data = array(
 			'title' => 'Edit Product',
 			'active' => 'inventory',
+			'error' => $error,
 			'product' => $product,
 			'categories' => $this->Category_model->get_all()
 		);
